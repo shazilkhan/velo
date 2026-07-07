@@ -1,107 +1,122 @@
 //! Recall / throughput harness.
 //!
 //! An approximate index trades a little accuracy for a lot of speed, so "it
-//! runs" is never enough — we have to *measure* how much accuracy survives. This
-//! binary builds an exact [`FlatIndex`] as ground truth and reports recall@k
-//! plus queries-per-second for the index under test.
+//! runs" is never enough — we have to *measure* how much accuracy survives and
+//! how much speed we bought. This binary builds an exact [`FlatIndex`] as ground
+//! truth and an [`HnswIndex`] as the index under test, then reports recall@k and
+//! the throughput of each.
 //!
-//! In Phase 0 the index under test *is* the flat index, so recall is 1.000 by
-//! construction. That is the point: the measuring apparatus lands before the
-//! HNSW index it exists to judge. In Phase 1 the `candidate` below becomes the
-//! HNSW graph and these numbers start telling the real story.
+//! ```text
+//! cargo run --release --bin recall
+//! ```
 
 use std::collections::HashSet;
+use std::f32::consts::TAU;
 use std::time::Instant;
 
-use velo::{FlatIndex, Metric, SearchResult, VectorIndex};
+use velo::rng::SplitMix64;
+use velo::{FlatIndex, HnswIndex, Metric, SearchResult, VectorIndex};
 
 fn main() {
-    let n = 10_000; // dataset size
+    let n = 20_000; // dataset size
     let d = 128; // dimensions
     let q = 1_000; // number of queries
     let k = 10; // neighbours per query
+    let clusters = 200; // topical clusters in the synthetic data
+    let metric = Metric::Cosine;
 
     let mut rng = SplitMix64::new(0x9E37_79B9_7F4A_7C15);
-    println!("building dataset: {n} vectors x {d} dims");
+    println!("dataset : {n} vectors x {d} dims, {clusters} clusters, metric = cosine\n");
 
-    let mut truth = FlatIndex::new(d, Metric::Cosine);
-    for id in 0..n {
-        truth.add(id as u64, &random_vector(&mut rng, d));
+    // Real embeddings cluster by meaning; uniformly random vectors do not, and
+    // in high dimensions they sit at near-identical distances (the curse of
+    // dimensionality), which makes "nearest" meaningless. So we sample around
+    // random cluster centres — a faithful stand-in for how embeddings behave.
+    let centers: Vec<Vec<f32>> = (0..clusters).map(|_| random_vector(&mut rng, d)).collect();
+    let data: Vec<Vec<f32>> = (0..n)
+        .map(|_| clustered_point(&mut rng, &centers, d))
+        .collect();
+    let queries: Vec<Vec<f32>> = (0..q)
+        .map(|_| clustered_point(&mut rng, &centers, d))
+        .collect();
+
+    // Exact ground truth.
+    let mut flat = FlatIndex::new(d, metric);
+    for (id, v) in data.iter().enumerate() {
+        flat.add(id as u64, v);
     }
 
-    // Phase 0: the candidate is another exact index, so it trivially matches
-    // ground truth. Swap this line for the HNSW index in Phase 1 and the same
-    // harness scores it unchanged.
-    let candidate = truth.clone();
+    // Approximate index under test. Build time matters too, so we time it.
+    let build_start = Instant::now();
+    let mut hnsw = HnswIndex::new(d, metric);
+    for (id, v) in data.iter().enumerate() {
+        hnsw.add(id as u64, v);
+    }
+    let build = build_start.elapsed();
 
-    let queries: Vec<Vec<f32>> = (0..q).map(|_| random_vector(&mut rng, d)).collect();
+    let (flat_hits, flat_qps) = timed_search(&flat, &queries, k);
+    let (hnsw_hits, hnsw_qps) = timed_search(&hnsw, &queries, k);
 
-    let truth_hits: Vec<Vec<SearchResult>> =
-        queries.iter().map(|query| truth.search(query, k)).collect();
+    let recall = mean_recall(&hnsw_hits, &flat_hits, k);
 
-    let start = Instant::now();
-    let candidate_hits: Vec<Vec<SearchResult>> = queries
-        .iter()
-        .map(|query| candidate.search(query, k))
-        .collect();
-    let elapsed = start.elapsed();
-
-    let mean_recall = candidate_hits
-        .iter()
-        .zip(&truth_hits)
-        .map(|(c, t)| recall_at_k(c, t))
-        .sum::<f32>()
-        / q as f32;
-
-    let qps = q as f64 / elapsed.as_secs_f64();
-
+    println!("build   : HNSW built in {:.2}s", build.as_secs_f64());
     println!();
-    println!("index      : FlatIndex (exact baseline)");
-    println!("metric     : cosine");
-    println!("dataset    : {n} vectors");
-    println!("queries    : {q}");
-    println!("k          : {k}");
-    println!("recall@{k}  : {mean_recall:.3}");
-    println!("throughput : {qps:.0} queries/sec");
+    println!(
+        "{:<12} {:>12} {:>14}",
+        "index",
+        "queries/sec",
+        &format!("recall@{k}")
+    );
+    println!("{:-<40}", "");
+    println!("{:<12} {:>12.0} {:>14}", "flat (exact)", flat_qps, "1.000");
+    println!("{:<12} {:>12.0} {:>14.3}", "hnsw", hnsw_qps, recall);
+    println!();
+    println!(
+        "speedup : {:.1}x faster than exact search",
+        hnsw_qps / flat_qps
+    );
 }
 
-/// Fraction of the true top-k that the candidate also returned, in `[0, 1]`.
-fn recall_at_k(candidate: &[SearchResult], truth: &[SearchResult]) -> f32 {
-    if truth.is_empty() {
-        return 1.0;
-    }
-    let truth_ids: HashSet<u64> = truth.iter().map(|r| r.id).collect();
-    let found = candidate
+/// Run every query against `index` and return the hit lists plus queries/sec.
+fn timed_search(
+    index: &impl VectorIndex,
+    queries: &[Vec<f32>],
+    k: usize,
+) -> (Vec<Vec<SearchResult>>, f64) {
+    let start = Instant::now();
+    let hits: Vec<Vec<SearchResult>> = queries.iter().map(|query| index.search(query, k)).collect();
+    let qps = queries.len() as f64 / start.elapsed().as_secs_f64();
+    (hits, qps)
+}
+
+/// Mean recall@k of `candidate` against `truth` across all queries.
+fn mean_recall(candidate: &[Vec<SearchResult>], truth: &[Vec<SearchResult>], k: usize) -> f32 {
+    let sum: f32 = candidate
         .iter()
-        .filter(|r| truth_ids.contains(&r.id))
-        .count();
-    found as f32 / truth.len() as f32
+        .zip(truth)
+        .map(|(c, t)| {
+            let truth_ids: HashSet<u64> = t.iter().map(|r| r.id).collect();
+            let found = c.iter().filter(|r| truth_ids.contains(&r.id)).count();
+            found as f32 / k as f32
+        })
+        .sum();
+    sum / candidate.len() as f32
 }
 
 fn random_vector(rng: &mut SplitMix64, d: usize) -> Vec<f32> {
     (0..d).map(|_| rng.next_f32() * 2.0 - 1.0).collect()
 }
 
-/// Tiny deterministic PRNG (SplitMix64) so benchmark runs are reproducible
-/// without pulling in a dependency. `velo` has zero runtime dependencies, and
-/// the harness keeps it that way.
-struct SplitMix64(u64);
+/// A point sampled near a randomly chosen cluster centre: `centre + noise`.
+fn clustered_point(rng: &mut SplitMix64, centers: &[Vec<f32>], d: usize) -> Vec<f32> {
+    let center = &centers[(rng.next_u64() as usize) % centers.len()];
+    const SIGMA: f32 = 0.15;
+    (0..d).map(|i| center[i] + SIGMA * gaussian(rng)).collect()
+}
 
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        SplitMix64(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// A uniform `f32` in `[0, 1)` drawn from the top 24 random bits.
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
-    }
+/// A standard-normal sample via the Box–Muller transform.
+fn gaussian(rng: &mut SplitMix64) -> f32 {
+    let u1 = rng.next_f32().max(1e-7);
+    let u2 = rng.next_f32();
+    (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
 }

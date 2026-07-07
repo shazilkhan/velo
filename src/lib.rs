@@ -10,16 +10,20 @@
 //!
 //! * [`FlatIndex`] — an exact, brute-force baseline. Correct, simple, and the
 //!   ground truth every approximate index is measured against.
-//! * an HNSW graph index — *coming next* — the fast approximate index.
+//! * [`HnswIndex`] — an HNSW graph index: fast, approximate, and scored for
+//!   recall against the exact baseline.
 //!
 //! See `src/bin/recall.rs` for the harness that scores one against the other.
 
 #![warn(missing_docs)]
 
 pub mod flat;
+pub mod hnsw;
 pub mod metric;
+pub mod rng;
 
 pub use flat::FlatIndex;
+pub use hnsw::{HnswConfig, HnswIndex};
 pub use metric::Metric;
 
 /// A single search hit.
@@ -33,9 +37,9 @@ pub struct SearchResult {
 
 /// The interface every index type implements.
 ///
-/// Today that is the brute-force [`FlatIndex`]; next it will also be an HNSW
-/// graph index. Sharing one trait is what lets the recall harness swap the
-/// index under test without touching the measurement code.
+/// Both the exact [`FlatIndex`] and the approximate [`HnswIndex`] implement it.
+/// Sharing one trait is what lets the recall harness swap the index under test
+/// without touching the measurement code.
 pub trait VectorIndex {
     /// Insert `vector` under `id`.
     ///

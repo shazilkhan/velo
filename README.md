@@ -30,9 +30,10 @@ Built in public, one phase at a time. Each phase is a working, tested commit.
 - [x] **Phase 0 — Foundation.** Metric trait (cosine / dot / L2), an exact
   brute-force `FlatIndex`, and a recall + throughput harness. This is the exact
   baseline everything after it is measured against.
-- [ ] **Phase 1 — HNSW.** The hierarchical navigable small-world graph index:
-  layered insertion, greedy `ef`-search, neighbour-selection heuristic. Scored
-  against the Phase 0 baseline for recall.
+- [x] **Phase 1 — HNSW.** The hierarchical navigable small-world graph index:
+  layered insertion, greedy `ef`-search, and the neighbour-selection heuristic —
+  stored as index-based adjacency lists. Scored against the Phase 0 baseline for
+  recall (see below).
 - [ ] **Phase 2 — Speed.** SIMD distance kernels, `criterion` benchmarks,
   recall-vs-throughput curves.
 - [ ] **Phase 3 — Persistence.** Memory-mapped segments + a write-ahead log,
@@ -46,9 +47,11 @@ properly first.
 ## Quick start
 
 ```rust
-use velo::{FlatIndex, Metric, VectorIndex};
+use velo::{HnswIndex, Metric, VectorIndex};
 
-let mut index = FlatIndex::new(3, Metric::Cosine);
+// Both index types share the same VectorIndex interface, so this is identical
+// for the exact `FlatIndex`.
+let mut index = HnswIndex::new(3, Metric::Cosine);
 index.add(1, &[0.1, 0.2, 0.3]);
 index.add(2, &[0.9, 0.1, 0.0]);
 
@@ -66,19 +69,34 @@ cargo run --release --bin recall
 ```
 
 ```
-index      : FlatIndex (exact baseline)
-metric     : cosine
-dataset    : 10000 vectors
-queries    : 1000
-k          : 10
-recall@10  : 1.000
-throughput : 1938 queries/sec
+dataset : 20000 vectors x 128 dims, 200 clusters, metric = cosine
+
+build   : HNSW built in 4.41s
+
+index         queries/sec      recall@10
+----------------------------------------
+flat (exact)          787          1.000
+hnsw                16168          1.000
+
+speedup : 20.5x faster than exact search
 ```
 
-The flat index is exact, so its recall is 1.000 by construction — that is the
-ground truth. When the HNSW index lands in Phase 1, the same harness scores it:
-the interesting numbers are how far recall stays above ~0.95 while throughput
-climbs by one to two orders of magnitude.
+The flat index is exact, so its recall is 1.000 by definition — it *is* the
+ground truth. HNSW recovers the same top-10 while answering ~20× more queries
+per second. That is the whole point of an ANN index: near-exact results at a
+fraction of the cost.
+
+> **A note on the data.** The harness samples vectors around random cluster
+> centres, because that is how real embeddings behave — they group by meaning.
+> Uniformly random vectors would be misleading: in 128 dimensions they sit at
+> nearly identical distances (the curse of dimensionality), so "nearest
+> neighbour" becomes meaningless and *no* ANN index scores well. Clustered data
+> is the honest, representative benchmark, and it is why standard ANN suites
+> (SIFT, GloVe) use structured real vectors too.
+
+*(Numbers from a single developer laptop; run `cargo run --release --bin recall`
+to reproduce. Correctness is also enforced in CI by a unit test that requires
+HNSW recall to stay above 0.90 against brute force.)*
 
 ## Design notes
 
