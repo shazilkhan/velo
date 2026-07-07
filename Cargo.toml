@@ -1,0 +1,19 @@
+[package]
+name = "velo"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "A small, readable vector database in Rust: a from-scratch HNSW index with an exact baseline and a recall harness."
+license = "MIT"
+repository = "https://github.com/shazilkhan/velo"
+readme = "README.md"
+keywords = ["vector-database", "hnsw", "ann", "search", "embeddings"]
+categories = ["database-implementations", "algorithms"]
+
+[[bin]]
+name = "recall"
+path = "src/bin/recall.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
