@@ -44,12 +44,16 @@ Built in public, one phase at a time. Each phase is a working, tested commit.
 - [x] **Phase 4 — Server.** An optional `axum` HTTP API (add / search / filtered
   search / stats / save / load) behind a `server` feature, plus a Docker image.
   The library itself stays dependency-free.
+- [x] **Phase 5 — Quantization.** Optional scalar quantization (`f32` → `u8`) via
+  `index.quantize()` — ~4× smaller vectors, with the recall cost measured (see
+  below).
 
 Roadmap, deliberately out of scope for v1: memory-mapped / write-ahead-logged
 storage (the current persistence is a whole-index snapshot, which is correct and
 simple; mmap + WAL is the incremental-durability optimization for later),
-sharding / distribution, vector quantization (PQ / SQ), and multiple index
-types. One node, one index, done properly first.
+sharding / distribution, product quantization (PQ, a step beyond the scalar
+quantization already implemented), and multiple index types. One node, one
+index, done properly first.
 
 ## Quick start
 
@@ -84,6 +88,9 @@ let filter = Filter::And(vec![
     Filter::Gt("year".into(), 2020.0),
 ]);
 let hits = index.search_filtered(&[0.1, 0.2, 0.25], 10, &filter);
+
+// Compress vectors f32 -> u8 (~4x smaller) once the index is built.
+index.quantize();
 
 // Snapshot the whole index — vectors, graph, and payloads — to disk and back.
 index.save("index.velo").unwrap();
@@ -124,6 +131,19 @@ tradeoff: at `ef_search = 20`, HNSW recovers **99%** of the true neighbours at
 **~21× the throughput** of exact search; push it to 40 and recall is
 indistinguishable from exact while still ~13× faster. That curve is the whole
 point of an ANN index, and it is measured here, not asserted.
+
+The same harness then compresses the vectors with scalar quantization and
+re-measures:
+
+```
+scalar quantization (ef_search = 64):
+  f32      recall@10 1.000   vectors    9 MB
+  u8  (SQ) recall@10 0.979   vectors    2 MB   (4.0x smaller)
+```
+
+`index.quantize()` maps every component from `f32` to `u8` per-dimension: a **4×
+cut in vector memory** for a recall dip from 1.000 to ~0.98. Distances are
+computed by dequantizing on the fly, so no decompressed copy is ever held.
 
 The distance kernels themselves are benchmarked with `criterion` (`cargo bench`).
 Per call on 128-dim `f32` vectors, via the AVX2 + FMA path:
@@ -202,6 +222,10 @@ docker run -p 8080:8080 -e VELO_DIM=128 velo
   little-endian format (`persist.rs`) rather than a `serde` + `bincode`
   dependency — fixed-width scalars, length-prefixed strings and payloads, a magic
   header and a version byte.
+- **Storage is pluggable behind the graph.** The HNSW logic never touches raw
+  vectors — it asks a `VectorStore` for distances. That one seam is what lets
+  `f32` and quantized `u8` storage coexist with zero changes to the graph code,
+  and it is where a future product-quantized or mmap-backed store would slot in.
 
 ## Development
 

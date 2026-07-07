@@ -26,7 +26,9 @@ use std::path::Path;
 
 use crate::payload::{Filter, Payload};
 use crate::persist;
+use crate::quant::ScalarQuantizer;
 use crate::rng::SplitMix64;
+use crate::store::VectorStore;
 use crate::{Metric, SearchResult, VectorIndex};
 
 /// Hard ceiling on layer count, so a pathological random draw can never blow up
@@ -37,7 +39,7 @@ const MAX_LEVEL: usize = 32;
 const MAGIC: &[u8; 4] = b"VELO";
 
 /// On-disk format version. Bump on any breaking change to the layout.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// Construction and search parameters for an [`HnswIndex`].
 ///
@@ -108,8 +110,8 @@ pub struct HnswIndex {
     /// Level-generation normaliser, `1 / ln(m)`.
     ml: f64,
     ids: Vec<u64>,
-    /// Row-major `len × dim` matrix of every stored vector.
-    data: Vec<f32>,
+    /// Backing vector storage (full-precision or scalar-quantized).
+    store: VectorStore,
     /// Optional metadata per node, indexed like `ids`. `None` = no payload.
     payloads: Vec<Option<Payload>>,
     /// `links[node][layer]` = neighbour node indices of `node` on `layer`.
@@ -141,7 +143,7 @@ impl HnswIndex {
             config,
             ml: 1.0 / (config.m as f64).ln(),
             ids: Vec::new(),
-            data: Vec::new(),
+            store: VectorStore::plain(dim),
             payloads: Vec::new(),
             links: Vec::new(),
             node_layer: Vec::new(),
@@ -181,14 +183,47 @@ impl HnswIndex {
         self.config
     }
 
+    /// Distance from stored vector `i` to an external full-precision query.
     #[inline]
-    fn vector(&self, i: usize) -> &[f32] {
-        &self.data[i * self.dim..(i + 1) * self.dim]
+    fn dist_to_query(&self, i: usize, query: &[f32]) -> f32 {
+        self.store.dist_to_query(self.metric, i, query)
+    }
+
+    /// Distance between two stored vectors.
+    #[inline]
+    fn dist_between(&self, i: usize, j: usize) -> f32 {
+        self.store.dist_between(self.metric, i, j)
     }
 
     #[inline]
     fn payload(&self, node: usize) -> Option<&Payload> {
         self.payloads.get(node).and_then(Option::as_ref)
+    }
+
+    /// Whether vectors are stored in scalar-quantized (`u8`) form.
+    pub fn is_quantized(&self) -> bool {
+        self.store.is_quantized()
+    }
+
+    /// Compress the stored vectors in place with scalar quantization, cutting
+    /// vector memory roughly 4x (`f32` -> `u8`).
+    ///
+    /// Trains the quantizer on the vectors already inserted, so call it after
+    /// building the index. Searches afterwards run on the quantized codes and
+    /// trade a little recall for the smaller footprint — measure it with the
+    /// recall harness. Vectors added later are encoded with the same quantizer.
+    /// A no-op if already quantized.
+    pub fn quantize(&mut self) {
+        if let VectorStore::Plain { dim, data } = &self.store {
+            let dim = *dim;
+            let quant = ScalarQuantizer::train(dim, data);
+            let count = self.ids.len();
+            let mut codes = vec![0u8; count * dim];
+            for (row, chunk) in codes.chunks_exact_mut(dim).enumerate() {
+                quant.encode_into(&data[row * dim..(row + 1) * dim], chunk);
+            }
+            self.store = VectorStore::quantized_from(dim, codes, quant);
+        }
     }
 
     #[inline]
@@ -232,7 +267,7 @@ impl HnswIndex {
 
         for &ep in entry_points {
             let s = Scored {
-                dist: self.metric.distance(query, self.vector(ep as usize)),
+                dist: self.dist_to_query(ep as usize, query),
                 node: ep,
             };
             visited.insert(ep);
@@ -255,7 +290,7 @@ impl HnswIndex {
             }
             for &e in &self.links[c.node as usize][layer] {
                 if visited.insert(e) {
-                    let d = self.metric.distance(query, self.vector(e as usize));
+                    let d = self.dist_to_query(e as usize, query);
                     let improves = w.len() < ef || w.peek().is_none_or(|f| d < f.dist);
                     if improves {
                         let s = Scored { dist: d, node: e };
@@ -291,9 +326,7 @@ impl HnswIndex {
             }
             let mut keep = true;
             for &r in &result {
-                let d = self
-                    .metric
-                    .distance(self.vector(cand.node as usize), self.vector(r as usize));
+                let d = self.dist_between(cand.node as usize, r as usize);
                 if d < cand.dist {
                     keep = false;
                     break;
@@ -309,11 +342,10 @@ impl HnswIndex {
     /// Re-run neighbour selection on `node`'s layer-`layer` connections after an
     /// insert pushed it over the connection cap.
     fn prune(&mut self, node: u32, layer: usize, m_max: usize) {
-        let base = self.vector(node as usize).to_vec();
         let mut cands: Vec<Scored> = self.links[node as usize][layer]
             .iter()
             .map(|&x| Scored {
-                dist: self.metric.distance(&base, self.vector(x as usize)),
+                dist: self.dist_between(node as usize, x as usize),
                 node: x,
             })
             .collect();
@@ -366,7 +398,7 @@ impl HnswIndex {
 
         let node = self.ids.len() as u32;
         self.ids.push(id);
-        self.data.extend_from_slice(vector);
+        self.store.push(vector);
         self.payloads.push(payload);
 
         let level = self.random_level();
@@ -497,8 +529,26 @@ impl HnswIndex {
         for &id in &self.ids {
             persist::write_u64(w, id)?;
         }
-        for &x in &self.data {
-            persist::write_f32(w, x)?;
+        // Vector storage: tag 0 = full-precision f32, tag 1 = scalar-quantized.
+        match &self.store {
+            VectorStore::Plain { data, .. } => {
+                persist::write_u8(w, 0)?;
+                for &x in data {
+                    persist::write_f32(w, x)?;
+                }
+            }
+            VectorStore::Quantized { codes, quant, .. } => {
+                persist::write_u8(w, 1)?;
+                for &code in codes {
+                    persist::write_u8(w, code)?;
+                }
+                for &m in quant.min() {
+                    persist::write_f32(w, m)?;
+                }
+                for &s in quant.scale() {
+                    persist::write_f32(w, s)?;
+                }
+            }
         }
         for &level in &self.node_layer {
             persist::write_u32(w, level as u32)?;
@@ -550,10 +600,40 @@ impl HnswIndex {
         for _ in 0..count {
             ids.push(persist::read_u64(r)?);
         }
-        let mut data = Vec::with_capacity(count * dim);
-        for _ in 0..count * dim {
-            data.push(persist::read_f32(r)?);
-        }
+        let store = match persist::read_u8(r)? {
+            0 => {
+                let mut data = Vec::with_capacity(count * dim);
+                for _ in 0..count * dim {
+                    data.push(persist::read_f32(r)?);
+                }
+                VectorStore::plain_from(dim, data)
+            }
+            1 => {
+                let mut codes = vec![0u8; count * dim];
+                for code in &mut codes {
+                    *code = persist::read_u8(r)?;
+                }
+                let mut min = Vec::with_capacity(dim);
+                for _ in 0..dim {
+                    min.push(persist::read_f32(r)?);
+                }
+                let mut scale = Vec::with_capacity(dim);
+                for _ in 0..dim {
+                    scale.push(persist::read_f32(r)?);
+                }
+                VectorStore::quantized_from(
+                    dim,
+                    codes,
+                    ScalarQuantizer::from_parts(dim, min, scale),
+                )
+            }
+            tag => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown vector store tag {tag}"),
+                ))
+            }
+        };
         let mut node_layer = Vec::with_capacity(count);
         for _ in 0..count {
             node_layer.push(persist::read_u32(r)? as usize);
@@ -587,7 +667,7 @@ impl HnswIndex {
             },
             ml: 1.0 / (m as f64).ln(),
             ids,
-            data,
+            store,
             payloads,
             links,
             node_layer,
@@ -754,6 +834,66 @@ mod tests {
         let filter = Filter::Gt("k".into(), 0.0);
         let filtered = loaded.search_filtered(&random_vec(&mut qrng, d), 5, &filter);
         assert!(!filtered.is_empty());
+    }
+
+    #[test]
+    fn quantization_keeps_recall_high() {
+        // Quantized search should still recover most of the exact neighbours.
+        let d = 32;
+        let mut rng = SplitMix64::new(2024);
+
+        let mut hnsw = HnswIndex::new(d, Metric::L2);
+        let mut flat = FlatIndex::new(d, Metric::L2);
+        let clusters: Vec<Vec<f32>> = (0..40).map(|_| random_vec(&mut rng, d)).collect();
+        for id in 0..3000u64 {
+            let c = &clusters[(rng.next_u64() as usize) % clusters.len()];
+            let v: Vec<f32> = (0..d)
+                .map(|i| c[i] + 0.1 * (rng.next_f32() * 2.0 - 1.0))
+                .collect();
+            hnsw.add(id, &v);
+            flat.add(id, &v);
+        }
+
+        assert!(!hnsw.is_quantized());
+        hnsw.quantize();
+        assert!(hnsw.is_quantized());
+
+        let k = 10;
+        let queries = 200;
+        let mut total = 0.0f32;
+        for _ in 0..queries {
+            let c = &clusters[(rng.next_u64() as usize) % clusters.len()];
+            let q: Vec<f32> = (0..d)
+                .map(|i| c[i] + 0.1 * (rng.next_f32() * 2.0 - 1.0))
+                .collect();
+            let truth: HashSet<u64> = flat.search(&q, k).into_iter().map(|r| r.id).collect();
+            let got = hnsw.search(&q, k);
+            total += got.iter().filter(|r| truth.contains(&r.id)).count() as f32 / k as f32;
+        }
+        let recall = total / queries as f32;
+        assert!(recall > 0.85, "quantized recall too low: {recall:.3}");
+    }
+
+    #[test]
+    fn quantized_index_survives_save_load() {
+        let d = 16;
+        let mut rng = SplitMix64::new(321);
+        let mut idx = HnswIndex::new(d, Metric::Cosine);
+        for id in 0..500u64 {
+            idx.add(id, &random_vec(&mut rng, d));
+        }
+        idx.quantize();
+
+        let path = std::env::temp_dir().join("velo_quantized_roundtrip.bin");
+        idx.save(&path).unwrap();
+        let loaded = HnswIndex::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(loaded.is_quantized());
+        let q = random_vec(&mut rng, d);
+        let before: Vec<u64> = idx.search(&q, 10).iter().map(|r| r.id).collect();
+        let after: Vec<u64> = loaded.search(&q, 10).iter().map(|r| r.id).collect();
+        assert_eq!(before, after);
     }
 
     #[test]

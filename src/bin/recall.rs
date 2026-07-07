@@ -87,6 +87,30 @@ fn main() {
             qps / flat_qps
         );
     }
+
+    // Scalar quantization: same graph, vectors compressed from f32 to u8.
+    hnsw.set_ef_search(64);
+    let (plain_hits, _) = timed_search(&hnsw, &queries, k);
+    let plain_recall = mean_recall(&plain_hits, &flat_hits, k);
+
+    let mut quantized = hnsw.clone();
+    quantized.quantize();
+    let (quant_hits, _) = timed_search(&quantized, &queries, k);
+    let quant_recall = mean_recall(&quant_hits, &flat_hits, k);
+
+    let plain_bytes = n * d * 4;
+    let quant_bytes = n * d + d * 8; // codes + per-dim min/scale
+    println!();
+    println!("scalar quantization (ef_search = 64):");
+    println!(
+        "  f32      recall@{k} {plain_recall:.3}   vectors {:>4} MB",
+        plain_bytes / 1_048_576
+    );
+    println!(
+        "  u8  (SQ) recall@{k} {quant_recall:.3}   vectors {:>4} MB   ({:.1}x smaller)",
+        quant_bytes / 1_048_576,
+        plain_bytes as f64 / quant_bytes as f64
+    );
 }
 
 /// Run every query against `index` and return the hit lists plus queries/sec.

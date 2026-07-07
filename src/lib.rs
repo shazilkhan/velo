@@ -27,7 +27,9 @@ pub mod rng;
 pub mod server;
 
 mod persist;
+mod quant;
 mod simd;
+mod store;
 
 pub use flat::FlatIndex;
 pub use hnsw::{HnswConfig, HnswIndex};
