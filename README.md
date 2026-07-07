@@ -37,13 +37,16 @@ Built in public, one phase at a time. Each phase is a working, tested commit.
 - [x] **Phase 2 — Speed.** Hand-written AVX2 + FMA distance kernels (runtime
   feature-detected, scalar fallback), `criterion` micro-benchmarks, and a
   recall-vs-throughput sweep (see below).
-- [ ] **Phase 3 — Persistence.** Memory-mapped segments + a write-ahead log,
-  payload storage, and metadata filtering during search.
+- [x] **Phase 3 — Database features.** Per-vector metadata payloads, filtered
+  search (typed `Eq`/`Gt`/`Lt` + `And`/`Or`/`Not`), and full save/load to a
+  compact binary format — all dependency-free and round-trip tested.
 - [ ] **Phase 4 — Server.** An `axum` HTTP API, collections, and a Docker image.
 
-Roadmap, deliberately out of scope for v1: sharding / distribution, vector
-quantization (PQ / SQ), and multiple index types. One node, one index, done
-properly first.
+Roadmap, deliberately out of scope for v1: memory-mapped / write-ahead-logged
+storage (the current persistence is a whole-index snapshot, which is correct and
+simple; mmap + WAL is the incremental-durability optimization for later),
+sharding / distribution, vector quantization (PQ / SQ), and multiple index
+types. One node, one index, done properly first.
 
 ## Quick start
 
@@ -59,6 +62,34 @@ index.add(2, &[0.9, 0.1, 0.0]);
 let hits = index.search(&[0.1, 0.2, 0.25], 1);
 assert_eq!(hits[0].id, 1);
 ```
+
+### Metadata filtering and persistence
+
+```rust
+use velo::{Filter, HnswIndex, Metric, Payload, Value, VectorIndex};
+
+let mut index = HnswIndex::new(3, Metric::Cosine);
+
+let mut meta = Payload::new();
+meta.insert("lang".into(), Value::Str("en".into()));
+meta.insert("year".into(), Value::Int(2023));
+index.add_with_payload(1, &[0.1, 0.2, 0.3], meta);
+
+// Nearest neighbours, restricted to vectors whose payload matches.
+let filter = Filter::And(vec![
+    Filter::Eq("lang".into(), Value::Str("en".into())),
+    Filter::Gt("year".into(), 2020.0),
+]);
+let hits = index.search_filtered(&[0.1, 0.2, 0.25], 10, &filter);
+
+// Snapshot the whole index — vectors, graph, and payloads — to disk and back.
+index.save("index.velo").unwrap();
+let reloaded = HnswIndex::load("index.velo").unwrap();
+```
+
+Filtered search still traverses the graph by distance for connectivity, but only
+matching vectors enter the result set — so a very selective filter just needs a
+larger `ef_search`.
 
 ## The recall harness
 
@@ -131,6 +162,14 @@ HNSW recall to stay above 0.90 against brute force.)*
   *runtime* via `is_x86_feature_detected!` with a scalar fallback for other CPUs
   and architectures. No `unsafe` leaks into the public API, and the crate stays
   dependency-free.
+- **Filtering is graph-aware, not post-hoc.** A filtered search keeps exploring
+  the graph by distance (so connectivity is preserved) while admitting only
+  matching vectors to the result set — the same `search_layer` primitive, with an
+  optional predicate threaded through.
+- **Persistence is hand-rolled and readable.** Save/load is a small, explicit
+  little-endian format (`persist.rs`) rather than a `serde` + `bincode`
+  dependency — fixed-width scalars, length-prefixed strings and payloads, a magic
+  header and a version byte.
 
 ## Development
 

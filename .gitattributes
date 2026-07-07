@@ -1,0 +1,5 @@
+# Normalise line endings: LF in the repo, on every platform.
+* text=auto eol=lf
+
+# Treat saved indexes and other binaries as binary.
+*.velo binary

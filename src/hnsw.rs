@@ -20,13 +20,24 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::Path;
 
+use crate::payload::{Filter, Payload};
+use crate::persist;
 use crate::rng::SplitMix64;
 use crate::{Metric, SearchResult, VectorIndex};
 
 /// Hard ceiling on layer count, so a pathological random draw can never blow up
 /// per-node storage. Reaching even layer 16 is astronomically unlikely.
 const MAX_LEVEL: usize = 32;
+
+/// Magic bytes at the head of a saved index file.
+const MAGIC: &[u8; 4] = b"VELO";
+
+/// On-disk format version. Bump on any breaking change to the layout.
+const FORMAT_VERSION: u32 = 1;
 
 /// Construction and search parameters for an [`HnswIndex`].
 ///
@@ -99,6 +110,8 @@ pub struct HnswIndex {
     ids: Vec<u64>,
     /// Row-major `len × dim` matrix of every stored vector.
     data: Vec<f32>,
+    /// Optional metadata per node, indexed like `ids`. `None` = no payload.
+    payloads: Vec<Option<Payload>>,
     /// `links[node][layer]` = neighbour node indices of `node` on `layer`.
     links: Vec<Vec<Vec<u32>>>,
     /// Top layer each node participates in.
@@ -129,6 +142,7 @@ impl HnswIndex {
             ml: 1.0 / (config.m as f64).ln(),
             ids: Vec::new(),
             data: Vec::new(),
+            payloads: Vec::new(),
             links: Vec::new(),
             node_layer: Vec::new(),
             entry: None,
@@ -173,6 +187,11 @@ impl HnswIndex {
     }
 
     #[inline]
+    fn payload(&self, node: usize) -> Option<&Payload> {
+        self.payloads.get(node).and_then(Option::as_ref)
+    }
+
+    #[inline]
     fn max_conn(&self, layer: usize) -> usize {
         if layer == 0 {
             self.config.m * 2
@@ -199,11 +218,16 @@ impl HnswIndex {
         entry_points: &[u32],
         ef: usize,
         layer: usize,
+        filter: Option<&Filter>,
     ) -> Vec<Scored> {
+        let matches = |node: u32| filter.is_none_or(|f| f.matches(self.payload(node as usize)));
+
         let mut visited: HashSet<u32> = HashSet::with_capacity(ef * 4);
         // `candidates` is a min-heap (nearest first) of frontier nodes to expand.
+        // The frontier is driven purely by distance so the graph stays fully
+        // traversable; the `filter` only gates what lands in the result set `w`.
         let mut candidates: BinaryHeap<Reverse<Scored>> = BinaryHeap::new();
-        // `w` is a max-heap (farthest first) of the best `ef` results so far.
+        // `w` is a max-heap (farthest first) of the best `ef` *matching* results.
         let mut w: BinaryHeap<Scored> = BinaryHeap::new();
 
         for &ep in entry_points {
@@ -213,7 +237,9 @@ impl HnswIndex {
             };
             visited.insert(ep);
             candidates.push(Reverse(s));
-            w.push(s);
+            if matches(ep) {
+                w.push(s);
+            }
         }
         while w.len() > ef {
             w.pop();
@@ -230,13 +256,15 @@ impl HnswIndex {
             for &e in &self.links[c.node as usize][layer] {
                 if visited.insert(e) {
                     let d = self.metric.distance(query, self.vector(e as usize));
-                    let admit = w.len() < ef || w.peek().map_or(true, |f| d < f.dist);
-                    if admit {
+                    let improves = w.len() < ef || w.peek().is_none_or(|f| d < f.dist);
+                    if improves {
                         let s = Scored { dist: d, node: e };
                         candidates.push(Reverse(s));
-                        w.push(s);
-                        if w.len() > ef {
-                            w.pop();
+                        if matches(e) {
+                            w.push(s);
+                            if w.len() > ef {
+                                w.pop();
+                            }
                         }
                     }
                 }
@@ -294,13 +322,52 @@ impl HnswIndex {
     }
 }
 
-impl VectorIndex for HnswIndex {
-    fn add(&mut self, id: u64, vector: &[f32]) {
+impl HnswIndex {
+    /// Insert a vector together with a metadata [`Payload`], enabling filtered
+    /// search over it via [`search_filtered`](Self::search_filtered).
+    pub fn add_with_payload(&mut self, id: u64, vector: &[f32], payload: Payload) {
+        self.insert(id, vector, Some(payload));
+    }
+
+    /// Nearest neighbours restricted to vectors whose payload matches `filter`.
+    ///
+    /// The graph is still traversed by distance for connectivity, but only
+    /// matching vectors enter the result set. A very selective filter therefore
+    /// explores more of the graph for the same `ef_search`; raise it with
+    /// [`set_ef_search`](Self::set_ef_search) if recall on a rare filter matters.
+    pub fn search_filtered(&self, query: &[f32], k: usize, filter: &Filter) -> Vec<SearchResult> {
+        assert_eq!(query.len(), self.dim, "query dimension mismatch");
+        if k == 0 {
+            return Vec::new();
+        }
+        let Some(entry) = self.entry else {
+            return Vec::new();
+        };
+
+        let mut ep = entry;
+        for lc in (1..=self.max_layer).rev() {
+            if let Some(nearest) = self.search_layer(query, &[ep], 1, lc, None).first() {
+                ep = nearest.node;
+            }
+        }
+        let ef = self.config.ef_search.max(k);
+        self.search_layer(query, &[ep], ef, 0, Some(filter))
+            .into_iter()
+            .take(k)
+            .map(|s| SearchResult {
+                id: self.ids[s.node as usize],
+                distance: s.dist,
+            })
+            .collect()
+    }
+
+    fn insert(&mut self, id: u64, vector: &[f32], payload: Option<Payload>) {
         assert_eq!(vector.len(), self.dim, "vector dimension mismatch");
 
         let node = self.ids.len() as u32;
         self.ids.push(id);
         self.data.extend_from_slice(vector);
+        self.payloads.push(payload);
 
         let level = self.random_level();
         self.node_layer.push(level);
@@ -320,7 +387,7 @@ impl VectorIndex for HnswIndex {
         // narrowing to the closest single entry point.
         if max_layer > level {
             for lc in ((level + 1)..=max_layer).rev() {
-                if let Some(nearest) = self.search_layer(vector, &[ep], 1, lc).first() {
+                if let Some(nearest) = self.search_layer(vector, &[ep], 1, lc, None).first() {
                     ep = nearest.node;
                 }
             }
@@ -331,7 +398,8 @@ impl VectorIndex for HnswIndex {
         let start = level.min(max_layer);
         let mut entry_points = vec![ep];
         for lc in (0..=start).rev() {
-            let found = self.search_layer(vector, &entry_points, self.config.ef_construction, lc);
+            let found =
+                self.search_layer(vector, &entry_points, self.config.ef_construction, lc, None);
             let m = self.max_conn(lc);
             let selected = self.select_neighbors(&found, m);
 
@@ -356,6 +424,12 @@ impl VectorIndex for HnswIndex {
             self.max_layer = level;
         }
     }
+}
+
+impl VectorIndex for HnswIndex {
+    fn add(&mut self, id: u64, vector: &[f32]) {
+        self.insert(id, vector, None);
+    }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
         assert_eq!(query.len(), self.dim, "query dimension mismatch");
@@ -368,13 +442,13 @@ impl VectorIndex for HnswIndex {
 
         let mut ep = entry;
         for lc in (1..=self.max_layer).rev() {
-            if let Some(nearest) = self.search_layer(query, &[ep], 1, lc).first() {
+            if let Some(nearest) = self.search_layer(query, &[ep], 1, lc, None).first() {
                 ep = nearest.node;
             }
         }
 
         let ef = self.config.ef_search.max(k);
-        self.search_layer(query, &[ep], ef, 0)
+        self.search_layer(query, &[ep], ef, 0, None)
             .into_iter()
             .take(k)
             .map(|s| SearchResult {
@@ -387,6 +461,163 @@ impl VectorIndex for HnswIndex {
     fn len(&self) -> usize {
         self.ids.len()
     }
+}
+
+impl HnswIndex {
+    /// Serialize the whole index — vectors, graph, and payloads — to `path` in
+    /// velo's compact binary format.
+    pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let mut writer = BufWriter::new(File::create(path)?);
+        self.write_to(&mut writer)?;
+        writer.flush()
+    }
+
+    /// Load an index previously written by [`save`](Self::save).
+    ///
+    /// Returns an [`io::Error`] of kind `InvalidData` if the file is not a velo
+    /// index or was written by an incompatible format version.
+    pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
+        let mut reader = BufReader::new(File::open(path)?);
+        Self::read_from(&mut reader)
+    }
+
+    fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(MAGIC)?;
+        persist::write_u32(w, FORMAT_VERSION)?;
+        persist::write_u8(w, metric_tag(self.metric))?;
+        persist::write_u32(w, self.dim as u32)?;
+        persist::write_u32(w, self.config.m as u32)?;
+        persist::write_u32(w, self.config.ef_construction as u32)?;
+        persist::write_u32(w, self.config.ef_search as u32)?;
+        persist::write_u64(w, self.config.seed)?;
+        persist::write_i64(w, self.entry.map_or(-1, i64::from))?;
+        persist::write_u32(w, self.max_layer as u32)?;
+
+        persist::write_u32(w, self.ids.len() as u32)?;
+        for &id in &self.ids {
+            persist::write_u64(w, id)?;
+        }
+        for &x in &self.data {
+            persist::write_f32(w, x)?;
+        }
+        for &level in &self.node_layer {
+            persist::write_u32(w, level as u32)?;
+        }
+        // Each node stores exactly `node_layer + 1` adjacency lists.
+        for layers in &self.links {
+            for neighbours in layers {
+                persist::write_u32(w, neighbours.len() as u32)?;
+                for &nb in neighbours {
+                    persist::write_u32(w, nb)?;
+                }
+            }
+        }
+        for payload in &self.payloads {
+            persist::write_payload(w, payload.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a velo index",
+            ));
+        }
+        let version = persist::read_u32(r)?;
+        if version != FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported velo format version {version}"),
+            ));
+        }
+
+        let metric = metric_from_tag(persist::read_u8(r)?)?;
+        let dim = persist::read_u32(r)? as usize;
+        let m = persist::read_u32(r)? as usize;
+        let ef_construction = persist::read_u32(r)? as usize;
+        let ef_search = persist::read_u32(r)? as usize;
+        let seed = persist::read_u64(r)?;
+        let entry_raw = persist::read_i64(r)?;
+        let entry = (entry_raw >= 0).then_some(entry_raw as u32);
+        let max_layer = persist::read_u32(r)? as usize;
+
+        let count = persist::read_u32(r)? as usize;
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            ids.push(persist::read_u64(r)?);
+        }
+        let mut data = Vec::with_capacity(count * dim);
+        for _ in 0..count * dim {
+            data.push(persist::read_f32(r)?);
+        }
+        let mut node_layer = Vec::with_capacity(count);
+        for _ in 0..count {
+            node_layer.push(persist::read_u32(r)? as usize);
+        }
+        let mut links = Vec::with_capacity(count);
+        for &level in &node_layer {
+            let mut layers = Vec::with_capacity(level + 1);
+            for _ in 0..=level {
+                let len = persist::read_u32(r)? as usize;
+                let mut neighbours = Vec::with_capacity(len);
+                for _ in 0..len {
+                    neighbours.push(persist::read_u32(r)?);
+                }
+                layers.push(neighbours);
+            }
+            links.push(layers);
+        }
+        let mut payloads = Vec::with_capacity(count);
+        for _ in 0..count {
+            payloads.push(persist::read_payload(r)?);
+        }
+
+        Ok(Self {
+            dim,
+            metric,
+            config: HnswConfig {
+                m,
+                ef_construction,
+                ef_search,
+                seed,
+            },
+            ml: 1.0 / (m as f64).ln(),
+            ids,
+            data,
+            payloads,
+            links,
+            node_layer,
+            entry,
+            max_layer,
+            rng: SplitMix64::new(seed),
+        })
+    }
+}
+
+fn metric_tag(metric: Metric) -> u8 {
+    match metric {
+        Metric::Cosine => 0,
+        Metric::Dot => 1,
+        Metric::L2 => 2,
+    }
+}
+
+fn metric_from_tag(tag: u8) -> io::Result<Metric> {
+    Ok(match tag {
+        0 => Metric::Cosine,
+        1 => Metric::Dot,
+        2 => Metric::L2,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown metric tag {other}"),
+            ))
+        }
+    })
 }
 
 #[cfg(test)]
@@ -458,5 +689,79 @@ mod tests {
         }
         let recall = total / queries as f32;
         assert!(recall > 0.90, "recall too low: {recall:.3}");
+    }
+
+    #[test]
+    fn filtered_search_returns_only_matching() {
+        use crate::payload::{Filter, Payload, Value};
+
+        let d = 8;
+        let mut rng = SplitMix64::new(99);
+        let mut idx = HnswIndex::new(d, Metric::Cosine);
+        for id in 0..1000u64 {
+            let v = random_vec(&mut rng, d);
+            let mut p = Payload::new();
+            let lang = if id % 2 == 0 { "en" } else { "fr" };
+            p.insert("lang".into(), Value::Str(lang.into()));
+            idx.add_with_payload(id, &v, p);
+        }
+
+        let query = random_vec(&mut rng, d);
+        let filter = Filter::Eq("lang".into(), Value::Str("en".into()));
+        let hits = idx.search_filtered(&query, 10, &filter);
+
+        assert!(!hits.is_empty());
+        for hit in &hits {
+            assert_eq!(hit.id % 2, 0, "returned non-matching id {}", hit.id);
+        }
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_results() {
+        use crate::payload::{Filter, Payload, Value};
+
+        let d = 12;
+        let mut rng = SplitMix64::new(7);
+        let mut idx = HnswIndex::new(d, Metric::Cosine);
+        for id in 0..800u64 {
+            let v = random_vec(&mut rng, d);
+            if id % 3 == 0 {
+                let mut p = Payload::new();
+                p.insert("k".into(), Value::Int(id as i64));
+                idx.add_with_payload(id, &v, p);
+            } else {
+                idx.add(id, &v);
+            }
+        }
+
+        let path = std::env::temp_dir().join("velo_roundtrip_test.bin");
+        idx.save(&path).unwrap();
+        let loaded = HnswIndex::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.len(), idx.len());
+
+        // Identical queries must return identical results on the reloaded index.
+        let mut qrng = SplitMix64::new(555);
+        for _ in 0..50 {
+            let q = random_vec(&mut qrng, d);
+            let before: Vec<u64> = idx.search(&q, 10).iter().map(|r| r.id).collect();
+            let after: Vec<u64> = loaded.search(&q, 10).iter().map(|r| r.id).collect();
+            assert_eq!(before, after);
+        }
+
+        // Payloads survive too, so filtered search still works after loading.
+        let filter = Filter::Gt("k".into(), 0.0);
+        let filtered = loaded.search_filtered(&random_vec(&mut qrng, d), 5, &filter);
+        assert!(!filtered.is_empty());
+    }
+
+    #[test]
+    fn load_rejects_a_non_velo_file() {
+        let path = std::env::temp_dir().join("velo_bad_magic_test.bin");
+        std::fs::write(&path, b"not a velo file at all").unwrap();
+        let result = HnswIndex::load(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(result.is_err());
     }
 }

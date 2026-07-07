@@ -20,13 +20,16 @@
 pub mod flat;
 pub mod hnsw;
 pub mod metric;
+pub mod payload;
 pub mod rng;
 
+mod persist;
 mod simd;
 
 pub use flat::FlatIndex;
 pub use hnsw::{HnswConfig, HnswIndex};
 pub use metric::Metric;
+pub use payload::{Filter, Payload, Value};
 
 /// A single search hit.
 #[derive(Debug, Clone, Copy, PartialEq)]
