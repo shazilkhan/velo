@@ -204,8 +204,8 @@ curl -X POST localhost:8080/search \
                {"gt":{"key":"year","value":2020}}]}}'
 ```
 
-Endpoints: `GET /health`, `GET /stats`, `POST /vectors`, `POST /search`,
-`POST /save`, `POST /load`. Or run it in a container:
+Endpoints: `GET /health`, `GET /stats`, `POST /vectors`, `DELETE /vectors/:id`,
+`POST /search`, `POST /save`, `POST /load`. Or run it in a container:
 
 ```
 docker build -t velo .
@@ -241,6 +241,10 @@ docker run -p 8080:8080 -e VELO_DIM=128 velo
   vectors — it asks a `VectorStore` for distances. That one seam is what lets
   `f32` and quantized `u8` storage coexist with zero changes to the graph code,
   and it is where a future product-quantized or mmap-backed store would slot in.
+- **Deletes are tombstones.** `index.remove(id)` marks a node dead so it is never
+  returned, but leaves it in the graph so its neighbours stay reachable —
+  deleting a node's edges would tear holes in the navigable graph. Filtering and
+  deletion share the same admission gate in `search_layer`.
 
 ## Development
 

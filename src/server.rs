@@ -12,15 +12,16 @@
 //! | `GET  /health`  | —                                 | liveness probe             |
 //! | `GET  /stats`   | —                                 | count / dim / metric       |
 //! | `POST /vectors` | `{id, vector, payload?}`          | insert a vector            |
+//! | `DELETE /vectors/:id` | —                           | remove a vector            |
 //! | `POST /search`  | `{vector, k?, filter?}`           | (filtered) nearest search  |
 //! | `POST /save`    | `{path}`                          | snapshot index to disk     |
 //! | `POST /load`    | `{path}`                          | replace index from disk    |
 
 use std::sync::{Arc, RwLock};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,7 @@ pub fn app(index: HnswIndex) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/stats", get(stats))
         .route("/vectors", post(add_vector))
+        .route("/vectors/:id", delete(remove_vector))
         .route("/search", post(search))
         .route("/save", post(save))
         .route("/load", post(load))
@@ -91,6 +93,16 @@ async fn add_vector(
         dim: index.dim(),
         metric: format!("{:?}", index.metric()),
     }))
+}
+
+#[derive(Serialize)]
+struct RemoveResponse {
+    removed: bool,
+}
+
+async fn remove_vector(State(db): State<Db>, Path(id): Path<u64>) -> Json<RemoveResponse> {
+    let removed = db.write().expect("lock poisoned").remove(id);
+    Json(RemoveResponse { removed })
 }
 
 #[derive(Deserialize)]

@@ -19,7 +19,7 @@
 //! contiguous for cache-friendly distance computation.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -39,7 +39,7 @@ const MAX_LEVEL: usize = 32;
 const MAGIC: &[u8; 4] = b"VELO";
 
 /// On-disk format version. Bump on any breaking change to the layout.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// Construction and search parameters for an [`HnswIndex`].
 ///
@@ -114,6 +114,12 @@ pub struct HnswIndex {
     store: VectorStore,
     /// Optional metadata per node, indexed like `ids`. `None` = no payload.
     payloads: Vec<Option<Payload>>,
+    /// Tombstones, indexed like `ids`. A deleted node stays in the graph for
+    /// connectivity but is never returned from a search.
+    deleted: Vec<bool>,
+    /// Lookup from external id to node index, for deletion. Deleted ids are
+    /// removed from it.
+    id_to_node: HashMap<u64, u32>,
     /// `links[node][layer]` = neighbour node indices of `node` on `layer`.
     links: Vec<Vec<Vec<u32>>>,
     /// Top layer each node participates in.
@@ -145,6 +151,8 @@ impl HnswIndex {
             ids: Vec::new(),
             store: VectorStore::plain(dim),
             payloads: Vec::new(),
+            deleted: Vec::new(),
+            id_to_node: HashMap::new(),
             links: Vec::new(),
             node_layer: Vec::new(),
             entry: None,
@@ -205,6 +213,31 @@ impl HnswIndex {
         self.store.is_quantized()
     }
 
+    /// Remove the vector with this `id`, returning `true` if it was present.
+    ///
+    /// This is a tombstone: the node stays in the graph so its neighbours remain
+    /// reachable, but it is never returned from a search again. Ids are assumed
+    /// unique; re-inserting a removed id is not supported. After many deletions,
+    /// rebuilding the index reclaims the space and connectivity.
+    pub fn remove(&mut self, id: u64) -> bool {
+        if let Some(node) = self.id_to_node.remove(&id) {
+            self.deleted[node as usize] = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Number of vectors that are still live (inserted minus removed).
+    pub fn live_len(&self) -> usize {
+        self.id_to_node.len()
+    }
+
+    #[inline]
+    fn is_live(&self, node: u32) -> bool {
+        !self.deleted[node as usize]
+    }
+
     /// Compress the stored vectors in place with scalar quantization, cutting
     /// vector memory roughly 4x (`f32` -> `u8`).
     ///
@@ -255,7 +288,12 @@ impl HnswIndex {
         layer: usize,
         filter: Option<&Filter>,
     ) -> Vec<Scored> {
-        let matches = |node: u32| filter.is_none_or(|f| f.matches(self.payload(node as usize)));
+        // A node may enter the result set only if it is live and matches the
+        // filter. Traversal (the `candidates` frontier) is never gated, so
+        // tombstoned nodes still connect the graph.
+        let matches = |node: u32| {
+            self.is_live(node) && filter.is_none_or(|f| f.matches(self.payload(node as usize)))
+        };
 
         let mut visited: HashSet<u32> = HashSet::with_capacity(ef * 4);
         // `candidates` is a min-heap (nearest first) of frontier nodes to expand.
@@ -400,6 +438,8 @@ impl HnswIndex {
         self.ids.push(id);
         self.store.push(vector);
         self.payloads.push(payload);
+        self.deleted.push(false);
+        self.id_to_node.insert(id, node);
 
         let level = self.random_level();
         self.node_layer.push(level);
@@ -565,6 +605,9 @@ impl HnswIndex {
         for payload in &self.payloads {
             persist::write_payload(w, payload.as_ref())?;
         }
+        for &is_deleted in &self.deleted {
+            persist::write_u8(w, u8::from(is_deleted))?;
+        }
         Ok(())
     }
 
@@ -655,6 +698,17 @@ impl HnswIndex {
         for _ in 0..count {
             payloads.push(persist::read_payload(r)?);
         }
+        let mut deleted = Vec::with_capacity(count);
+        for _ in 0..count {
+            deleted.push(persist::read_u8(r)? != 0);
+        }
+        // Rebuild the id -> node lookup from the live (non-deleted) nodes.
+        let mut id_to_node = HashMap::with_capacity(count);
+        for (node, (&id, &is_deleted)) in ids.iter().zip(&deleted).enumerate() {
+            if !is_deleted {
+                id_to_node.insert(id, node as u32);
+            }
+        }
 
         Ok(Self {
             dim,
@@ -669,6 +723,8 @@ impl HnswIndex {
             ids,
             store,
             payloads,
+            deleted,
+            id_to_node,
             links,
             node_layer,
             entry,
@@ -894,6 +950,54 @@ mod tests {
         let before: Vec<u64> = idx.search(&q, 10).iter().map(|r| r.id).collect();
         let after: Vec<u64> = loaded.search(&q, 10).iter().map(|r| r.id).collect();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn removed_vectors_are_never_returned() {
+        let d = 8;
+        let mut rng = SplitMix64::new(4242);
+        let mut idx = HnswIndex::new(d, Metric::L2);
+        for id in 0..600u64 {
+            idx.add(id, &random_vec(&mut rng, d));
+        }
+        assert_eq!(idx.live_len(), 600);
+
+        // Remove the true nearest neighbour of a query, then confirm it is gone.
+        let q = random_vec(&mut rng, d);
+        let nearest = idx.search(&q, 1)[0].id;
+        assert!(idx.remove(nearest));
+        assert!(!idx.remove(nearest)); // second removal is a no-op
+        assert_eq!(idx.live_len(), 599);
+
+        for hit in idx.search(&q, 20) {
+            assert_ne!(hit.id, nearest, "removed id came back");
+        }
+    }
+
+    #[test]
+    fn deletions_survive_save_load() {
+        let d = 10;
+        let mut rng = SplitMix64::new(88);
+        let mut idx = HnswIndex::new(d, Metric::Cosine);
+        for id in 0..400u64 {
+            idx.add(id, &random_vec(&mut rng, d));
+        }
+        for id in (0..400u64).step_by(5) {
+            idx.remove(id);
+        }
+        let live = idx.live_len();
+
+        let path = std::env::temp_dir().join("velo_delete_roundtrip.bin");
+        idx.save(&path).unwrap();
+        let loaded = HnswIndex::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.live_len(), live);
+        // A removed id must stay removed after a reload.
+        let q = random_vec(&mut rng, d);
+        for hit in loaded.search(&q, 30) {
+            assert_ne!(hit.id % 5, 0, "a deleted id survived reload");
+        }
     }
 
     #[test]
