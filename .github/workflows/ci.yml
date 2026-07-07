@@ -35,6 +35,9 @@ jobs:
       - name: Benchmarks compile
         run: cargo bench --no-run
 
+      - name: Examples compile
+        run: cargo build --examples
+
       - name: Recall harness
         run: cargo run --release --bin recall
 

@@ -101,6 +101,21 @@ Filtered search still traverses the graph by distance for connectivity, but only
 matching vectors enter the result set — so a very selective filter just needs a
 larger `ef_search`.
 
+### A runnable demo
+
+[`examples/semantic_search.rs`](examples/semantic_search.rs) indexes a dozen
+sentences and answers plain-language queries by meaning — the whole pipeline end
+to end, dependency-free:
+
+```
+$ cargo run --example semantic_search
+
+query: "a fast language for low level systems work"
+  0.533  Rust is a systems programming language focused on safety and speed
+  0.566  Python is a high level language popular for data science and scripting
+  ...
+```
+
 ## The recall harness
 
 An approximate index is only worth anything if you know how much accuracy it
