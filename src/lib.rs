@@ -23,6 +23,9 @@ pub mod metric;
 pub mod payload;
 pub mod rng;
 
+#[cfg(feature = "server")]
+pub mod server;
+
 mod persist;
 mod simd;
 

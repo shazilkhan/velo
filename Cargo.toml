@@ -10,9 +10,24 @@ readme = "README.md"
 keywords = ["vector-database", "hnsw", "ann", "search", "embeddings"]
 categories = ["database-implementations", "algorithms"]
 
+[features]
+# The library is dependency-free; the optional HTTP server pulls in axum + tokio.
+server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json"]
+
+[dependencies]
+axum = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
 [[bin]]
 name = "recall"
 path = "src/bin/recall.rs"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+required-features = ["server"]
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

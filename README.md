@@ -13,7 +13,8 @@ or [Qdrant](https://github.com/qdrant/qdrant). It is to build the same core they
 build — an HNSW graph index — in code you can actually read end to end, with the
 correctness and throughput measured at every step rather than assumed.
 
-Zero runtime dependencies.
+**The library has zero runtime dependencies.** The optional HTTP server (behind
+the `server` feature) is the only thing that pulls in axum + tokio + serde.
 
 ## Why
 
@@ -40,7 +41,9 @@ Built in public, one phase at a time. Each phase is a working, tested commit.
 - [x] **Phase 3 — Database features.** Per-vector metadata payloads, filtered
   search (typed `Eq`/`Gt`/`Lt` + `And`/`Or`/`Not`), and full save/load to a
   compact binary format — all dependency-free and round-trip tested.
-- [ ] **Phase 4 — Server.** An `axum` HTTP API, collections, and a Docker image.
+- [x] **Phase 4 — Server.** An optional `axum` HTTP API (add / search / filtered
+  search / stats / save / load) behind a `server` feature, plus a Docker image.
+  The library itself stays dependency-free.
 
 Roadmap, deliberately out of scope for v1: memory-mapped / write-ahead-logged
 storage (the current persistence is a whole-index snapshot, which is correct and
@@ -145,6 +148,35 @@ Per call on 128-dim `f32` vectors, via the AVX2 + FMA path:
 to reproduce. Correctness is also enforced in CI by a unit test that requires
 HNSW recall to stay above 0.90 against brute force.)*
 
+## HTTP server (optional)
+
+A thin REST API over an in-memory index, behind the `server` feature so it never
+touches the core library's dependency-free build:
+
+```
+cargo run --features server --bin server        # listens on 0.0.0.0:8080
+# configure with VELO_DIM (default 128) and VELO_ADDR (default 0.0.0.0:8080)
+```
+
+```bash
+curl -X POST localhost:8080/vectors \
+  -d '{"id":1,"vector":[ ... ],"payload":{"lang":"en","year":2023}}'
+
+# filtered nearest-neighbour search
+curl -X POST localhost:8080/search \
+  -d '{"vector":[ ... ],"k":10,"filter":
+       {"and":[{"eq":{"key":"lang","value":"en"}},
+               {"gt":{"key":"year","value":2020}}]}}'
+```
+
+Endpoints: `GET /health`, `GET /stats`, `POST /vectors`, `POST /search`,
+`POST /save`, `POST /load`. Or run it in a container:
+
+```
+docker build -t velo .
+docker run -p 8080:8080 -e VELO_DIM=128 velo
+```
+
 ## Design notes
 
 - **Distance as a single convention.** Every metric returns a *distance* where
@@ -179,6 +211,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 cargo run --release --bin recall   # recall-vs-throughput sweep
 cargo bench           # criterion micro-benchmarks
+cargo test --features server       # + the HTTP server
 ```
 
 ## License

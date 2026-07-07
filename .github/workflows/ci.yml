@@ -37,3 +37,8 @@ jobs:
 
       - name: Recall harness
         run: cargo run --release --bin recall
+
+      - name: Server feature (clippy + test)
+        run: |
+          cargo clippy --features server --all-targets -- -D warnings
+          cargo test --features server
