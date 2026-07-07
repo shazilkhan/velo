@@ -32,5 +32,8 @@ jobs:
       - name: Test
         run: cargo test --all
 
+      - name: Benchmarks compile
+        run: cargo bench --no-run
+
       - name: Recall harness
         run: cargo run --release --bin recall

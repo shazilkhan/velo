@@ -22,6 +22,8 @@ pub mod hnsw;
 pub mod metric;
 pub mod rng;
 
+mod simd;
+
 pub use flat::FlatIndex;
 pub use hnsw::{HnswConfig, HnswIndex};
 pub use metric::Metric;

@@ -55,26 +55,38 @@ fn main() {
     let build = build_start.elapsed();
 
     let (flat_hits, flat_qps) = timed_search(&flat, &queries, k);
-    let (hnsw_hits, hnsw_qps) = timed_search(&hnsw, &queries, k);
-
-    let recall = mean_recall(&hnsw_hits, &flat_hits, k);
 
     println!("build   : HNSW built in {:.2}s", build.as_secs_f64());
     println!();
     println!(
-        "{:<12} {:>12} {:>14}",
-        "index",
+        "{:>10} {:>12} {:>12} {:>10}",
+        "ef_search",
         "queries/sec",
-        &format!("recall@{k}")
+        &format!("recall@{k}"),
+        "speedup"
     );
-    println!("{:-<40}", "");
-    println!("{:<12} {:>12.0} {:>14}", "flat (exact)", flat_qps, "1.000");
-    println!("{:<12} {:>12.0} {:>14.3}", "hnsw", hnsw_qps, recall);
-    println!();
+    println!("{:-<48}", "");
     println!(
-        "speedup : {:.1}x faster than exact search",
-        hnsw_qps / flat_qps
+        "{:>10} {:>12.0} {:>12.3} {:>10}",
+        "flat", flat_qps, 1.000, "1.0x"
     );
+
+    // Sweep the search-time candidate width. Higher ef_search explores more of
+    // the graph, so recall climbs toward the exact result while throughput
+    // falls. This curve *is* the approximate-search tradeoff, measured rather
+    // than asserted.
+    for ef in [10usize, 20, 40, 80, 160] {
+        hnsw.set_ef_search(ef);
+        let (hits, qps) = timed_search(&hnsw, &queries, k);
+        let recall = mean_recall(&hits, &flat_hits, k);
+        println!(
+            "{:>10} {:>12.0} {:>12.3} {:>9.1}x",
+            ef,
+            qps,
+            recall,
+            qps / flat_qps
+        );
+    }
 }
 
 /// Run every query against `index` and return the hit lists plus queries/sec.

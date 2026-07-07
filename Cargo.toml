@@ -14,6 +14,17 @@ categories = ["database-implementations", "algorithms"]
 name = "recall"
 path = "src/bin/recall.rs"
 
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "distance"
+harness = false
+
+[[bench]]
+name = "search"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

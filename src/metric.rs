@@ -35,21 +35,19 @@ impl Metric {
 }
 
 /// Inner (dot) product of two equal-length vectors.
+///
+/// SIMD-accelerated where the CPU supports it; see the crate-internal `simd` module.
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    crate::simd::dot(a, b)
 }
 
 /// Squared Euclidean distance between two equal-length vectors.
+///
+/// SIMD-accelerated where the CPU supports it; see the crate-internal `simd` module.
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
+    crate::simd::l2_squared(a, b)
 }
 
 /// Cosine distance (`1 - cosine_similarity`) between two equal-length vectors.
@@ -58,15 +56,10 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 /// report the maximally-dissimilar value `1.0` rather than a `NaN`.
 #[inline]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for (x, y) in a.iter().zip(b) {
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
+    let dot = crate::simd::dot(a, b);
+    let norm_a = crate::simd::dot(a, a);
+    let norm_b = crate::simd::dot(b, b);
+    let denom = (norm_a * norm_b).sqrt();
     if denom == 0.0 {
         return 1.0;
     }

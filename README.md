@@ -34,8 +34,9 @@ Built in public, one phase at a time. Each phase is a working, tested commit.
   layered insertion, greedy `ef`-search, and the neighbour-selection heuristic —
   stored as index-based adjacency lists. Scored against the Phase 0 baseline for
   recall (see below).
-- [ ] **Phase 2 — Speed.** SIMD distance kernels, `criterion` benchmarks,
-  recall-vs-throughput curves.
+- [x] **Phase 2 — Speed.** Hand-written AVX2 + FMA distance kernels (runtime
+  feature-detected, scalar fallback), `criterion` micro-benchmarks, and a
+  recall-vs-throughput sweep (see below).
 - [ ] **Phase 3 — Persistence.** Memory-mapped segments + a write-ahead log,
   payload storage, and metadata filtering during search.
 - [ ] **Phase 4 — Server.** An `axum` HTTP API, collections, and a Docker image.
@@ -71,20 +72,35 @@ cargo run --release --bin recall
 ```
 dataset : 20000 vectors x 128 dims, 200 clusters, metric = cosine
 
-build   : HNSW built in 4.41s
+build   : HNSW built in 2.96s
 
-index         queries/sec      recall@10
-----------------------------------------
-flat (exact)          787          1.000
-hnsw                16168          1.000
-
-speedup : 20.5x faster than exact search
+ ef_search  queries/sec    recall@10    speedup
+------------------------------------------------
+      flat         1648        1.000       1.0x
+        10        44536        0.939      27.0x
+        20        34051        0.991      20.7x
+        40        20807        1.000      12.6x
+        80        17132        1.000      10.4x
+       160         8061        1.000       4.9x
 ```
 
 The flat index is exact, so its recall is 1.000 by definition — it *is* the
-ground truth. HNSW recovers the same top-10 while answering ~20× more queries
-per second. That is the whole point of an ANN index: near-exact results at a
-fraction of the cost.
+ground truth. Sweeping `ef_search` traces the entire approximate-search
+tradeoff: at `ef_search = 20`, HNSW recovers **99%** of the true neighbours at
+**~21× the throughput** of exact search; push it to 40 and recall is
+indistinguishable from exact while still ~13× faster. That curve is the whole
+point of an ANN index, and it is measured here, not asserted.
+
+The distance kernels themselves are benchmarked with `criterion` (`cargo bench`).
+Per call on 128-dim `f32` vectors, via the AVX2 + FMA path:
+
+| kernel | time    |
+| ------ | ------- |
+| dot    | ~7.8 ns |
+| L2²    | ~8.7 ns |
+| cosine | ~27 ns  |
+
+(Cosine is roughly three dot products — `a·b`, `a·a`, `b·b` — hence ~3× dot.)
 
 > **A note on the data.** The harness samples vectors around random cluster
 > centres, because that is how real embeddings behave — they group by meaning.
@@ -107,17 +123,23 @@ HNSW recall to stay above 0.90 against brute force.)*
   index-based adjacency lists (`u32` node ids into flat `Vec`s), not
   `Rc<RefCell<Node>>`. This is the idiomatic way to build graph structures in
   Rust and it keeps the borrow checker out of the way.
-- **One trait, many indexes.** `FlatIndex` and the coming HNSW index both
-  implement `VectorIndex`, which is what lets the harness swap the index under
-  test without touching the measurement code.
+- **One trait, many indexes.** `FlatIndex` and `HnswIndex` both implement
+  `VectorIndex`, which is what lets the harness swap the index under test without
+  touching the measurement code.
+- **SIMD without a dependency.** Distance is the hot loop, so on x86-64 it runs a
+  hand-written AVX2 + FMA kernel (eight lanes per instruction), selected at
+  *runtime* via `is_x86_feature_detected!` with a scalar fallback for other CPUs
+  and architectures. No `unsafe` leaks into the public API, and the crate stays
+  dependency-free.
 
 ## Development
 
 ```
-cargo test            # unit tests
+cargo test            # unit tests, incl. the HNSW recall gate
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
-cargo run --release --bin recall
+cargo run --release --bin recall   # recall-vs-throughput sweep
+cargo bench           # criterion micro-benchmarks
 ```
 
 ## License

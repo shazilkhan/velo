@@ -144,6 +144,14 @@ impl HnswIndex {
         self
     }
 
+    /// Set the search-time candidate-list size in place.
+    ///
+    /// Only affects queries, not the stored graph, so it can be swept freely to
+    /// trade recall against latency on an already-built index.
+    pub fn set_ef_search(&mut self, ef_search: usize) {
+        self.config.ef_search = ef_search;
+    }
+
     /// The dimensionality this index expects.
     pub fn dim(&self) -> usize {
         self.dim
